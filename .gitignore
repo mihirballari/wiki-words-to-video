@@ -2,3 +2,6 @@ __pycache__/
 *.mp4
 frames/
 .DS_Store
+*.csv
+*.png
+runs/
