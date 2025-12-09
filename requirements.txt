@@ -2,3 +2,4 @@ wikipedia
 Pillow
 playwright
 requests
+matplotlib

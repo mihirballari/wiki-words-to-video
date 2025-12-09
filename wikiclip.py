@@ -122,8 +122,8 @@ def parse_args():
     parser.add_argument(
         "--zoom",
         type=float,
-        default=1.0,
-        help="Page zoom factor (1.0 = normal, >1 = closer, <1 = further).",
+        default=1.5,
+        help="Page zoom factor (1.5 = default, 1.0 = normal, >1 = closer, <1 = further).",
     )
     zoom_group = parser.add_mutually_exclusive_group()
     zoom_group.add_argument(
@@ -149,8 +149,8 @@ def parse_args():
     parser.add_argument(
         "--fps",
         type=int,
-        default=10,
-        help="Frames per second for the video (default: 10).",
+        default=15,
+        help="Frames per second for the video (default: 15).",
     )
     parser.add_argument(
         "--max-pages",

@@ -1,0 +1,8 @@
+Frames analyzed: 200
+Mean center error: 1.04% of half-diagonal
+Max center error: 43.84% of half-diagonal
+Anomalous frames (> threshold): 33
+Mean normalized area: 0.0051
+Average frame-to-frame area delta: 0.000592
+Mean deviation from linear zoom trend: 0.000452
+No area anomalies detected.
