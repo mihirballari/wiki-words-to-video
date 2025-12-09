@@ -13,6 +13,7 @@ from playwright.sync_api import sync_playwright
 from PIL import Image
 
 from video_utils import build_video_from_frames
+from zoom_utils import resolve_zoom_range
 
 HIDE_CHROME_CSS = """
 /* Hide some wiki chrome to keep things cleaner */
@@ -124,6 +125,22 @@ def parse_args():
         default=1.0,
         help="Page zoom factor (1.0 = normal, >1 = closer, <1 = further).",
     )
+    zoom_group = parser.add_mutually_exclusive_group()
+    zoom_group.add_argument(
+        "--zoom-in",
+        type=float,
+        help="Smoothly zoom IN over the final video by this multiplier (e.g. 1.5).",
+    )
+    zoom_group.add_argument(
+        "--zoom-out",
+        type=float,
+        help="Smoothly zoom OUT over the final video by this multiplier (e.g. 1.5).",
+    )
+    zoom_group.add_argument(
+        "--zoom-end",
+        type=float,
+        help="Final video zoom factor; equivalent to using --zoom plus a target.",
+    )
     parser.add_argument(
         "--out",
         default="out.mp4",
@@ -139,7 +156,7 @@ def parse_args():
         "--max-pages",
         type=int,
         default=50,
-        help="Max Wikipedia pages to use (default: 30).",
+        help="Max Wikipedia pages to use (default: 50).",
     )
     parser.add_argument(
         "--width",
@@ -152,6 +169,16 @@ def parse_args():
         type=int,
         default=576,
         help="Output frame height (default: 576).",
+    )
+    parser.add_argument(
+        "--crf",
+        default="18",
+        help="ffmpeg CRF for quality (default: 18; lower = better quality/larger file).",
+    )
+    parser.add_argument(
+        "--preset",
+        default="slow",
+        help="ffmpeg preset for encode speed/size (default: slow).",
     )
     parser.add_argument(
         "--seconds",
@@ -412,6 +439,9 @@ def save_center_debug(
 def main():
     args = parse_args()
     term = args.term.strip()
+    zoom_start, zoom_end = resolve_zoom_range(
+        args.zoom, args.zoom_end, args.zoom_in, args.zoom_out
+    )
 
     frames_dir = "frames"
     centers = [] if args.center_debug else None
@@ -482,7 +512,16 @@ def main():
     if args.center_debug and centers:
         save_center_debug(centers, args.width, args.height)
 
-    encode_secs, size_bytes = build_video_from_frames(frames_dir, args.fps, args.out)
+    encode_secs, size_bytes = build_video_from_frames(
+        frames_dir,
+        args.fps,
+        args.out,
+        frame_size=(args.width, args.height),
+        zoom_start=zoom_start,
+        zoom_end=zoom_end,
+        crf=args.crf,
+        preset=args.preset,
+    )
     size_mb = size_bytes / (1024 * 1024) if size_bytes else 0.0
 
     print("\n=== Summary ===")
