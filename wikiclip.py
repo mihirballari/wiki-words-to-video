@@ -1,86 +1,18 @@
-
-#!/usr/bin/env python3
+# !/usr/bin/env python3
 import argparse
 import os
-import platform
 import shutil
 import subprocess
+import time
+import math
+import csv
+import random
 
 import wikipedia
 from playwright.sync_api import sync_playwright
+from PIL import Image
 
-
-def parse_args():
-    parser = argparse.ArgumentParser(
-        description="Make a newspaper-style video of a word/phrase using real Wikipedia pages."
-    )
-    parser.add_argument(
-        "--term",
-        required=True,
-        help="Word or short phrase to highlight, e.g. 'hello' or 'hello world'.",
-    )
-    parser.add_argument(
-        "--out",
-        default="out.mp4",
-        help="Output video filename (default: out.mp4).",
-    )
-    parser.add_argument(
-        "--fps",
-        type=int,
-        default=10,
-        help="Frames per second for the video (default: 10).",
-    )
-    parser.add_argument(
-        "--seconds",
-        type=float,
-        default=None,
-        help="Target video length in seconds. If set, the script will "
-             "try to generate about fps * seconds frames.",
-    )
-    parser.add_argument(
-        "--max-pages",
-        type=int,
-        default=30,
-        help="Max Wikipedia pages to use in one pass (default: 30).",
-    )
-    parser.add_argument(
-        "--width",
-        type=int,
-        default=1024,
-        help="OUTPUT frame width in pixels (default: 1024).",
-    )
-    parser.add_argument(
-        "--height",
-        type=int,
-        default=576,
-        help="OUTPUT frame height in pixels (default: 576).",
-    )
-    parser.add_argument(
-        "--viewport-scale",
-        type=float,
-        default=1.6,
-        help="How much larger the browser viewport is than the frame "
-             "(default: 1.6). Larger = more room to center/crop.",
-    )
-    parser.add_argument(
-        "--zoom",
-        type=float,
-        default=1.0,
-        help="Page zoom factor. 1.0 = normal, >1 = closer (word bigger), "
-             "<1 = further (more page). Default: 1.0",
-    )
-    parser.add_argument(
-        "--clean",
-        action="store_true",
-        help="Delete generated frame images after building the video.",
-    )
-    return parser.parse_args()
-
-
-def get_page_titles(term: str, max_pages: int):
-    """Search Wikipedia for `term` and return up to `max_pages` page titles."""
-    return wikipedia.search(term, results=max_pages)
-
+from video_utils import build_video_from_frames
 
 HIDE_CHROME_CSS = """
 /* Hide some wiki chrome to keep things cleaner */
@@ -113,7 +45,9 @@ HIGHLIGHT_JS = """
     // Remove previous highlight if present
     document.querySelectorAll('.wwtv-highlight').forEach(span => {
         const parent = span.parentNode;
-        while (span.firstChild) parent.insertBefore(span.firstChild, span);
+        while (span.firstChild) {
+            parent.insertBefore(span.firstChild, span);
+        }
         parent.removeChild(span);
     });
 
@@ -143,7 +77,7 @@ HIGHLIGHT_JS = """
     }
 
     if (matches.length === 0) {
-        return 0; // no match on this page
+        return 0;
     }
 
     // Pick a random occurrence for variety
@@ -170,36 +104,144 @@ HIGHLIGHT_JS = """
 
     parent.removeChild(node);
 
+    span.scrollIntoView({ block: 'center', inline: 'center' });
     return matches.length;
 }
 """
 
-CENTER_JS = """
-() => {
-    const span = document.getElementById('wwtv-focus');
-    if (!span) return null;
+def parse_args():
+    parser = argparse.ArgumentParser(
+        description="Make a newspaper-style video of a word/phrase using real Wikipedia pages."
+    )
+    parser.add_argument(
+        "--term",
+        required=True,
+        help="Word or short phrase to highlight, e.g. 'hello' or 'hello world'.",
+    )
+    parser.add_argument(
+        "--zoom",
+        type=float,
+        default=1.0,
+        help="Page zoom factor (1.0 = normal, >1 = closer, <1 = further).",
+    )
+    parser.add_argument(
+        "--out",
+        default="out.mp4",
+        help="Output video filename (default: out.mp4).",
+    )
+    parser.add_argument(
+        "--fps",
+        type=int,
+        default=10,
+        help="Frames per second for the video (default: 10).",
+    )
+    parser.add_argument(
+        "--max-pages",
+        type=int,
+        default=50,
+        help="Max Wikipedia pages to use (default: 30).",
+    )
+    parser.add_argument(
+        "--width",
+        type=int,
+        default=1024,
+        help="Output frame width (default: 1024).",
+    )
+    parser.add_argument(
+        "--height",
+        type=int,
+        default=576,
+        help="Output frame height (default: 576).",
+    )
+    parser.add_argument(
+        "--seconds",
+        type=float,
+        default=None,
+        help=(
+            "Target video length in seconds. If we collect fewer frames than "
+            "fps * seconds, existing frames will be re-used to hit that length."
+        ),
+    )
+    parser.add_argument(
+        "--center-debug",
+        action="store_true",
+        help="Collect centering stats and write centers.csv + centers.png.",
+    )
+    return parser.parse_args()
 
-    const rect = span.getBoundingClientRect();
+def crop_around_highlight(raw_path, bbox, out_path, out_w, out_h):
+    """
+    Take a full-viewport screenshot and crop a window centered on the highlight,
+    then resize to (out_w, out_h). Return the normalized (fx, fy) position of
+    the highlight center in the FINAL frame (0..1 in each dimension).
+    """
+    img = Image.open(raw_path)
+    W, H = img.size  # viewport size in pixels
 
-    const targetX =
-        window.scrollX + rect.left + rect.width / 2 - window.innerWidth / 2;
-    const targetY =
-        window.scrollY + rect.top + rect.height / 2 - window.innerHeight / 2;
+    # Base crop window: some fraction of viewport, but with same aspect as output
+    base_fraction = 0.6  # 60% of viewport width by default
+    base_w = int(W * base_fraction)
+    target_ratio = out_w / out_h
+    base_h = int(base_w / target_ratio)
+    if base_h > H:
+        base_h = int(H * base_fraction)
+        base_w = int(base_h * target_ratio)
 
-    window.scrollTo(targetX, targetY);
+    # How big is the highlight relative to that base window?
+    highlight_ratio = bbox["width"] / base_w if base_w > 0 else 1.0
 
-    const r2 = span.getBoundingClientRect();
-    return {
-        left: r2.left,
-        top: r2.top,
-        width: r2.width,
-        height: r2.height,
-        vw: window.innerWidth,
-        vh: window.innerHeight
-    };
-}
-"""
+    # If highlight would fill too much of the window, zoom OUT so it only
+    # fills ~70% of the width at most.
+    max_fill = 0.7
+    zoom_factor = 1.0
+    if highlight_ratio > max_fill:
+        zoom_factor = min(
+            (highlight_ratio / max_fill),
+            W / base_w,
+            H / base_h,
+        )
 
+    crop_w = min(W, int(base_w * zoom_factor))
+    crop_h = min(H, int(base_h * zoom_factor))
+
+    # Center crop on highlight center
+    cx = bbox["x"] + bbox["width"] / 2.0
+    cy = bbox["y"] + bbox["height"] / 2.0
+
+    left = int(cx - crop_w / 2.0)
+    top = int(cy - crop_h / 2.0)
+
+    # Clamp to stay inside the image
+    if left < 0:
+        left = 0
+    if top < 0:
+        top = 0
+    if left + crop_w > W:
+        left = W - crop_w
+    if top + crop_h > H:
+        top = H - crop_h
+
+    box = (left, top, left + crop_w, top + crop_h)
+    cropped = img.crop(box)
+
+    # Compute highlight center in the FINAL frame
+    sx = out_w / crop_w
+    sy = out_h / crop_h
+    fx = (cx - left) * sx
+    fy = (cy - top) * sy
+    fx_norm = fx / out_w
+    fy_norm = fy / out_h
+
+    resized = cropped.resize((out_w, out_h), Image.LANCZOS)
+    resized.save(out_path)
+    img.close()
+
+    # normalized 0..1 coordinates of highlight center in the output frame
+    return fx_norm, fy_norm
+
+def get_page_titles(term: str, max_pages: int):
+    """Search Wikipedia for `term` and return up to `max_pages` page titles."""
+    return wikipedia.search(term, results=max_pages)
 
 def screenshot_page_with_term(
     page,
@@ -207,36 +249,34 @@ def screenshot_page_with_term(
     term,
     frame_idx,
     frames_dir,
-    frame_w,
-    frame_h,
-    viewport_w,
-    viewport_h,
+    out_w,
+    out_h,
     zoom,
+    centers=None,
 ):
     """
     Load one Wikipedia page, highlight a random occurrence of `term`,
-    zoom, center it, and screenshot a FIXED-SIZE clip around the highlight.
+    center it, screenshot the viewport, then crop around the highlight.
+    Also optionally record the final-frame center for centering diagnostics.
     """
     url_title = title.replace(" ", "_")
     url = f"https://en.wikipedia.org/wiki/{url_title}"
-    print(f"[{frame_idx:03d}] {title} -> {url}")
+    print(f"[{frame_idx:02d}] {title} -> {url}")
 
+    # Navigate
     try:
         page.goto(url, wait_until="networkidle", timeout=20000)
     except Exception as e:
         print(f"  -> failed to load: {e}")
         return False
 
-    # Apply zoom (how big the text appears on screen)
+    # Apply zoom (how big the page appears)
     try:
-        page.evaluate(
-            "(z) => { document.body.style.zoom = z; }",
-            zoom,
-        )
+        page.evaluate("(z) => { document.body.style.zoom = z; }", zoom)
     except Exception as e:
         print(f"  -> failed to set zoom, continuing with zoom=1.0: {e}")
 
-    # Inject CSS (every page, in case wiki layout changes)
+    # Inject CSS (hide chrome + highlight style)
     page.add_style_tag(content=HIDE_CHROME_CSS + HIGHLIGHT_CSS)
 
     # Highlight a random match on this page
@@ -245,13 +285,7 @@ def screenshot_page_with_term(
         print("  -> term not found on page; skipping")
         return False
 
-    # Center the highlight in the viewport
-    center_info = page.evaluate(CENTER_JS)
-    if center_info is None:
-        print("  -> could not center highlight; skipping")
-        return False
-
-    # Get bounding box of span relative to viewport
+    # Get bounding box of the span
     focus = page.locator("#wwtv-focus")
     try:
         box = focus.bounding_box()
@@ -262,95 +296,125 @@ def screenshot_page_with_term(
         print("  -> highlight not visible; skipping")
         return False
 
-    # Compute clip rectangle so that the highlight is centered in the frame
-    cx = box["x"] + box["width"] / 2.0
-    cy = box["y"] + box["height"] / 2.0
-
-    clip_x = int(cx - frame_w / 2.0)
-    clip_y = int(cy - frame_h / 2.0)
-
-    # Clamp clip rectangle to viewport so we never go "outside" the page
-    if clip_x < 0:
-        clip_x = 0
-    if clip_y < 0:
-        clip_y = 0
-    if clip_x + frame_w > viewport_w:
-        clip_x = max(0, viewport_w - frame_w)
-    if clip_y + frame_h > viewport_h:
-        clip_y = max(0, viewport_h - frame_h)
-
-    frame_path = os.path.join(frames_dir, f"frame_{frame_idx:05d}.png")
+    # Take full-viewport screenshot
+    raw_path = os.path.join(frames_dir, f"raw_{frame_idx:05d}.png")
+    final_path = os.path.join(frames_dir, f"frame_{frame_idx:05d}.png")
     try:
-        page.screenshot(
-            path=frame_path,
-            full_page=False,
-            clip={
-                "x": clip_x,
-                "y": clip_y,
-                "width": frame_w,
-                "height": frame_h,
-            },
-        )
+        page.screenshot(path=raw_path, full_page=False)
     except Exception as e:
         print(f"  -> screenshot failed: {e}")
         return False
 
+    # Crop around highlight and record center in final frame
+    try:
+        fx, fy = crop_around_highlight(raw_path, box, final_path, out_w, out_h)
+    finally:
+        if os.path.exists(raw_path):
+            os.remove(raw_path)
+
+    if centers is not None:
+        centers.append(
+            {
+                "frame_idx": frame_idx,
+                "page_title": title,
+                "x": fx,
+                "y": fy,
+            }
+        )
+
     return True
 
+def save_center_debug(
+    centers,
+    frame_w: int,
+    frame_h: int,
+    csv_path: str = "centers.csv",
+    png_path: str = "centers.png",
+):
+    """
+    centers: list of dicts with keys:
+      - frame_idx
+      - page_title
+      - x, y  (highlight center in FINAL frame coordinates, pixels)
+    Writes:
+      - centers.csv
+      - centers.png (2D heatmap of normalized centers)
+    """
+    if not centers:
+        return
 
-def open_video(out_path: str):
-    """Try to open the video file with the default player."""
-    system = platform.system()
+    max_r = math.hypot(frame_w / 2.0, frame_h / 2.0)
+
+    # --- CSV ---
+    with open(csv_path, "w", newline="") as f:
+        w = csv.writer(f)
+        w.writerow(["frame_idx", "page_title", "x", "y", "nx", "ny", "err_pct"])
+        for rec in centers:
+            x = rec["x"]
+            y = rec["y"]
+            nx = x / frame_w
+            ny = y / frame_h
+            dx = x - frame_w / 2.0
+            dy = y - frame_h / 2.0
+            err_pct = math.hypot(dx, dy) / max_r * 100.0
+            w.writerow(
+                [
+                    rec["frame_idx"],
+                    rec["page_title"],
+                    f"{x:.2f}",
+                    f"{y:.2f}",
+                    f"{nx:.4f}",
+                    f"{ny:.4f}",
+                    f"{err_pct:.2f}",
+                ]
+            )
+
+    # --- Heatmap ---
     try:
-        if system == "Darwin":  # macOS
-            subprocess.Popen(["open", out_path])
-        elif system == "Windows":
-            os.startfile(out_path)  # type: ignore[attr-defined]
-        else:  # Linux / other
-            subprocess.Popen(["xdg-open", out_path])
-    except Exception as e:
-        print(f"Could not auto-open video: {e}")
+        import matplotlib.pyplot as plt
+    except ImportError:
+        print("matplotlib not installed; skipping centers.png heat map.")
+        return
 
+    xs = [rec["x"] / frame_w for rec in centers]
+    ys = [rec["y"] / frame_h for rec in centers]
 
-def build_video_from_frames(frames_dir, fps, out_path):
-    """Call ffmpeg to build an MP4 from frames in `frames_dir`."""
-    if os.path.exists(out_path):
-        os.remove(out_path)
+    plt.figure(figsize=(6, 3.5))
+    plt.hist2d(xs, ys, bins=50, range=[[0.0, 1.0], [0.0, 1.0]])
+    plt.scatter([0.5], [0.5], marker="+", s=80, linewidths=2, label="Perfect center")
+    plt.xlim(0.0, 1.0)
+    plt.ylim(0.0, 1.0)
+    plt.gca().invert_yaxis()
+    plt.xlabel("Normalized X (0 = left, 1 = right)")
+    plt.ylabel("Normalized Y (0 = top, 1 = bottom)")
+    plt.title("Highlight center distribution")
+    plt.legend(loc="upper right")
+    plt.tight_layout()
+    plt.savefig(png_path, dpi=150)
+    plt.close()
 
-    cmd = [
-        "ffmpeg",
-        "-y",
-        "-framerate",
-        str(fps),
-        "-i",
-        os.path.join(frames_dir, "frame_%05d.png"),
-        "-c:v",
-        "libx264",
-        "-preset",
-        "slow",
-        "-crf",
-        "18",
-        "-pix_fmt",
-        "yuv420p",
-        out_path,
-    ]
-    print("Running:", " ".join(cmd))
-    subprocess.run(cmd, check=True)
+    # --- Console summary ---
+    err_vals = []
+    for rec in centers:
+        x = rec["x"]
+        y = rec["y"]
+        dx = x - frame_w / 2.0
+        dy = y - frame_h / 2.0
+        err_vals.append(math.hypot(dx, dy) / max_r * 100.0)
 
-    # Auto-open the video
-    open_video(out_path)
-
-
+    if err_vals:
+        print(
+            f"Centering stats: {len(err_vals)} frames, "
+            f"mean error ~{sum(err_vals)/len(err_vals):.2f}%, "
+            f"max error ~{max(err_vals):.2f}% "
+            f"(see {png_path})"
+        )
 def main():
     args = parse_args()
     term = args.term.strip()
 
-    frame_w = args.width
-    frame_h = args.height
-    viewport_w = int(frame_w * args.viewport_scale)
-    viewport_h = int(frame_h * args.viewport_scale)
-
     frames_dir = "frames"
+    centers = [] if args.center_debug else None
     if os.path.exists(frames_dir):
         shutil.rmtree(frames_dir)
     os.makedirs(frames_dir, exist_ok=True)
@@ -361,93 +425,74 @@ def main():
         return
 
     print(f"Found {len(titles)} candidate pages for '{term}'")
-    print(f"Frame size: {frame_w}x{frame_h}, viewport: {viewport_w}x{viewport_h}")
-    print(f"Zoom factor: {args.zoom}")
-
-    if args.seconds is not None and args.seconds > 0:
-        target_frames = int(max(1, round(args.fps * args.seconds)))
-        print(f"Target length: ~{args.seconds:.2f}s = {target_frames} frames at {args.fps} fps")
-    else:
-        target_frames = None
 
     used = 0
     with sync_playwright() as p:
+        # Render at 2× resolution for sharper downscaled frames
+        viewport_w = args.width * 2
+        viewport_h = args.height * 2
+
         browser = p.chromium.launch()
         page = browser.new_page(
             viewport={"width": viewport_w, "height": viewport_h}
         )
 
-        if target_frames is None:
-            # Single pass over pages
-            for title in titles:
-                ok = screenshot_page_with_term(
-                    page,
-                    title,
-                    term,
-                    used,
-                    frames_dir,
-                    frame_w,
-                    frame_h,
-                    viewport_w,
-                    viewport_h,
-                    args.zoom,
-                )
-                if ok:
-                    used += 1
-        else:
-            # Multiple passes until we hit target_frames or can't make more
-            passes = 0
-            MAX_PASSES = 20  # safety cap
-            while used < target_frames and passes < MAX_PASSES:
-                passes += 1
-                made_before = used
-                print(f"\n=== Pass {passes} over titles (current frames: {used}) ===")
-                for title in titles:
-                    if used >= target_frames:
-                        break
-                    ok = screenshot_page_with_term(
-                        page,
-                        title,
-                        term,
-                        used,
-                        frames_dir,
-                        frame_w,
-                        frame_h,
-                        viewport_w,
-                        viewport_h,
-                        args.zoom,
-                    )
-                    if ok:
-                        used += 1
-
-                if used == made_before:
-                    print("No new frames could be generated on this pass; stopping early.")
-                    break
-
-            if used < target_frames:
-                actual_len = used / float(args.fps)
-                print(
-                    f"Warning: only {used} frames generated (~{actual_len:.2f}s at "
-                    f"{args.fps} fps), fewer than requested {target_frames} frames."
-                )
+        for title in titles:
+            ok = screenshot_page_with_term(
+                page, title, term, used, frames_dir, args.width, args.height, args.zoom, centers=centers,
+            )
+            if ok:
+                used += 1
 
         browser.close()
 
+        total_frames = used
+
+        if args.seconds is not None and args.seconds > 0:
+            target_frames = int(round(args.seconds * args.fps))
+            print(
+                f"\nTarget length: ~{args.seconds:.2f}s -> "
+                f"{target_frames} frames at {args.fps} fps"
+            )
+
+            if target_frames > total_frames:
+                print(
+                    f"Only {total_frames} unique frames collected; "
+                    f"duplicating frames to reach {target_frames}."
+                )
+                for i in range(total_frames, target_frames):
+                    src_idx = random.randint(0, total_frames - 1)
+                    src_name = os.path.join(frames_dir, f"frame_{src_idx:05d}.png")
+                    dst_name = os.path.join(frames_dir, f"frame_{i:05d}.png")
+                    shutil.copy2(src_name, dst_name)
+                used = target_frames
+            else:
+                # We have at least as many frames as we need; just keep them all.
+                actual = total_frames / float(args.fps)
+                print(
+                    f"Collected {total_frames} frames (>= {target_frames}); "
+                    f"final length will be ~{actual:.2f}s."
+                )
+                used = total_frames
+    
     if used == 0:
         print("No pages produced frames; nothing to build.")
         return
 
-    build_video_from_frames(frames_dir, args.fps, args.out)
-    print(f"Done. Wrote {used} frames to {args.out}")
+    if args.center_debug and centers:
+        save_center_debug(centers, args.width, args.height)
 
-    if args.clean:
-        try:
-            shutil.rmtree(frames_dir)
-            print("Cleaned up frames/ directory.")
-        except Exception as e:
-            print(f"Could not remove frames directory: {e}")
+    encode_secs, size_bytes = build_video_from_frames(frames_dir, args.fps, args.out)
+    size_mb = size_bytes / (1024 * 1024) if size_bytes else 0.0
+
+    print("\n=== Summary ===")
+    print(f"Frames written: {used}")
+    if args.seconds is not None and args.seconds > 0:
+        print(f"Requested length: ~{args.seconds:.2f}s at {args.fps} fps")
+    print(f"Actual length:   ~{used/args.fps:.2f}s at {args.fps} fps")
+    print(f"Encode time:     {encode_secs:.2f}s")
+    print(f"Output size:     {size_mb:.2f} MiB -> {args.out}")
 
 
 if __name__ == "__main__":
     main()
-

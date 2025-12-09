@@ -1,3 +1,4 @@
 wikipedia
 Pillow
 playwright
+requests
