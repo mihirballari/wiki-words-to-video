@@ -1,0 +1,33 @@
+[build-system]
+requires = ["setuptools>=64", "wheel"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "wiki-words-to-video"
+version = "0.1.0"
+description = "Generate newspaper-style videos that highlight a term on real Wikipedia pages."
+readme = "README.md"
+requires-python = ">=3.9"
+dependencies = [
+    "wikipedia",
+    "Pillow",
+    "playwright",
+    "requests",
+    "matplotlib",
+]
+
+[project.scripts]
+wwtv = "wikiclip:main"
+
+[tool.setuptools]
+py-modules = [
+    "capture",
+    "center_diagnostics",
+    "clean_runs",
+    "compute_center_error",
+    "run_wikiclip_with_diagnostics",
+    "video_utils",
+    "wikiclip",
+    "wikiclip_sentence",
+    "zoom_utils",
+]

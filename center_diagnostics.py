@@ -370,13 +370,24 @@ def summarize(
     area_anomalies: List[int],
     out_path: str,
     skipped_frames: int = 0,
-) -> None:
+) -> dict:
+    summary = {}
     with open(out_path, "w") as f:
         if not errors:
             f.write("No center data found.\n")
-            return
+            return summary
         mean_err = sum(e["error_pct"] for e in errors) / len(errors)
         max_err = max(e["error_pct"] for e in errors)
+        summary.update(
+            {
+                "frames_analyzed": len(results),
+                "skipped_frames": skipped_frames,
+                "mean_center_error_pct": mean_err,
+                "max_center_error_pct": max_err,
+                "center_anomalies": anomalies,
+            }
+        )
+
         f.write(f"Frames analyzed: {len(results)}\n")
         if skipped_frames:
             f.write(f"Skipped duplicate frames: {skipped_frames}\n")
@@ -392,6 +403,15 @@ def summarize(
             mean_area = sum(areas) / len(areas)
             diffs = [abs(areas[i + 1] - areas[i]) for i in range(len(areas) - 1)]
             smoothness = sum(diffs) / len(diffs) if diffs else 0.0
+
+            summary.update(
+                {
+                    "mean_area": mean_area,
+                    "area_smoothness": smoothness,
+                    "area_anomalies": area_anomalies,
+                }
+            )
+
             f.write(f"Mean normalized area: {mean_area:.4f}\n")
             f.write(f"Average frame-to-frame area delta: {smoothness:.6f}\n")
 
@@ -402,6 +422,7 @@ def summarize(
                     expected = y0 + (y1 - y0) * i / (len(areas) - 1)
                     trend_diffs.append(abs(val - expected))
                 trend_error = sum(trend_diffs) / len(trend_diffs)
+                summary["area_trend_error"] = trend_error
                 f.write(f"Mean deviation from linear zoom trend: {trend_error:.6f}\n")
 
             if area_anomalies:
@@ -412,6 +433,7 @@ def summarize(
                 f.write("No area anomalies detected.\n")
         else:
             f.write("No highlight boxes detected; cannot evaluate area/zoom.\n")
+    return summary
 
 
 def run_full_diagnostics(
@@ -446,7 +468,7 @@ def run_full_diagnostics(
         print(f"Detected {len(area_anomalies)} area anomalies (threshold={area_threshold:.4f}).")
     plot_area_trend(results, area_anomalies, os.path.join(out_dir, "area_trend.png"))
 
-    summarize(
+    summary = summarize(
         results,
         errors,
         anomalies,
@@ -455,4 +477,14 @@ def run_full_diagnostics(
         skipped_frames=skipped,
     )
 
+    summary.update(
+        {
+            "anomalies_path": os.path.join(out_dir, "anomalies.txt"),
+            "heatmap_path": heatmap_path,
+            "center_errors_path": os.path.join(out_dir, "center_errors.png"),
+            "area_trend_path": os.path.join(out_dir, "area_trend.png"),
+        }
+    )
+
     print(f"Diagnostics written to {out_dir}/")
+    return summary

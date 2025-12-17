@@ -2,3 +2,10 @@ __pycache__/
 *.mp4
 frames/
 .DS_Store
+.venv/
+diagnostics/
+runs/
+sentence_frames/
+centers.csv
+wiki_words_to_video.egg-info/
+build/

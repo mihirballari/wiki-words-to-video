@@ -1,5 +1,6 @@
 # !/usr/bin/env python3
 import argparse
+import io
 import os
 import shutil
 import subprocess
@@ -9,7 +10,7 @@ import csv
 import random
 
 import wikipedia
-from playwright.sync_api import sync_playwright
+from playwright.sync_api import Error, sync_playwright
 from PIL import Image
 
 from video_utils import build_video_from_frames
@@ -18,6 +19,17 @@ from zoom_utils import resolve_zoom_range
 HIDE_CHROME_CSS = """
 /* Hide some wiki chrome to keep things cleaner */
 #siteNotice,
+#centralNotice,
+.centralnotice,
+#frbanner,
+#frb-main,
+#frb-form,
+#frb-nag,
+.frb-form,
+.frb-text,
+.frb-nag,
+.frb-form-wrapper,
+.wm-global-notice,
 .mw-head,
 #mw-head,
 #mw-page-base,
@@ -110,6 +122,104 @@ HIGHLIGHT_JS = """
 }
 """
 
+HIGHLIGHT_JS_CASE = """
+(term) => {
+    // Case-sensitive variant; falls back to case-insensitive if no exact hits.
+    const runSearch = (needle, ignoreCase) => {
+        const root =
+            document.querySelector('#mw-content-text') ||
+            document.body;
+
+        const walker = document.createTreeWalker(
+            root,
+            NodeFilter.SHOW_TEXT,
+            null
+        );
+
+        const matches = [];
+
+        while (walker.nextNode()) {
+            const node = walker.currentNode;
+            if (!node.nodeValue) continue;
+            const text = node.nodeValue;
+            let targetText = text;
+            let targetNeedle = needle;
+            if (ignoreCase) {
+                targetText = text.toLowerCase();
+                targetNeedle = needle.toLowerCase();
+            }
+            let idx = targetText.indexOf(targetNeedle);
+            while (idx !== -1) {
+                matches.push({ node, idx });
+                idx = targetText.indexOf(targetNeedle, idx + needle.length);
+            }
+        }
+        return matches;
+    };
+
+    // Remove previous highlight if present
+    document.querySelectorAll('.wwtv-highlight').forEach(span => {
+        const parent = span.parentNode;
+        while (span.firstChild) {
+            parent.insertBefore(span.firstChild, span);
+        }
+        parent.removeChild(span);
+    });
+
+    let matches = runSearch(term, false);
+    if (matches.length === 0) {
+        matches = runSearch(term, true);
+    }
+    if (matches.length === 0) {
+        return 0;
+    }
+
+    const choice = matches[Math.floor(Math.random() * matches.length)];
+    const node = choice.node;
+    const i = choice.idx;
+
+    const text = node.nodeValue;
+    const before = text.slice(0, i);
+    const mid = text.slice(i, i + term.length);
+    const after = text.slice(i + term.length);
+
+    const parent = node.parentNode;
+
+    if (before.length) parent.insertBefore(document.createTextNode(before), node);
+
+    const span = document.createElement('span');
+    span.className = 'wwtv-highlight';
+    span.id = 'wwtv-focus';
+    span.textContent = mid;
+    parent.insertBefore(span, node);
+
+    if (after.length) parent.insertBefore(document.createTextNode(after), node);
+
+    parent.removeChild(node);
+
+    span.scrollIntoView({ block: 'center', inline: 'center' });
+    return matches.length;
+}
+"""
+
+
+def launch_chromium(playwright):
+    """
+    Launch Chromium, with a friendly hint if the bundled browser is missing.
+    This avoids the opaque Playwright stack trace on fresh installs.
+    """
+    try:
+        return playwright.chromium.launch()
+    except Error as exc:
+        text = str(exc)
+        if "Executable doesn't exist" in text:
+            print(
+                "Playwright Chromium not found. Install browsers with:\n"
+                "  playwright install chromium"
+            )
+            return None
+        raise
+
 def parse_args():
     parser = argparse.ArgumentParser(
         description="Make a newspaper-style video of a word/phrase using real Wikipedia pages."
@@ -155,7 +265,7 @@ def parse_args():
     parser.add_argument(
         "--max-pages",
         type=int,
-        default=50,
+        default=20,
         help="Max Wikipedia pages to use (default: 50).",
     )
     parser.add_argument(
@@ -194,15 +304,26 @@ def parse_args():
         action="store_true",
         help="Collect centering stats and write centers.csv + centers.png.",
     )
+    parser.add_argument(
+        "--case-sensitive",
+        action="store_true",
+        help="Prefer case-sensitive term matching when highlighting.",
+    )
+    parser.add_argument(
+        "--capture-scale",
+        type=float,
+        default=2.0,
+        help="Render pages at this multiple of the final resolution before downscaling (quality vs speed).",
+    )
     return parser.parse_args()
 
-def crop_around_highlight(raw_path, bbox, out_path, out_w, out_h):
+def crop_around_highlight(raw_image, bbox, out_path, out_w, out_h):
     """
-    Take a full-viewport screenshot and crop a window centered on the highlight,
+    Take a full-viewport screenshot (bytes) and crop a window centered on the highlight,
     then resize to (out_w, out_h). Return the normalized (fx, fy) position of
     the highlight center in the FINAL frame (0..1 in each dimension).
     """
-    img = Image.open(raw_path)
+    img = Image.open(io.BytesIO(raw_image))
     W, H = img.size  # viewport size in pixels
 
     # Base crop window: some fraction of viewport, but with same aspect as output
@@ -280,6 +401,8 @@ def screenshot_page_with_term(
     out_h,
     zoom,
     centers=None,
+    *,
+    case_sensitive: bool = False,
 ):
     """
     Load one Wikipedia page, highlight a random occurrence of `term`,
@@ -292,7 +415,7 @@ def screenshot_page_with_term(
 
     # Navigate
     try:
-        page.goto(url, wait_until="networkidle", timeout=20000)
+        page.goto(url, wait_until="domcontentloaded", timeout=20000)
     except Exception as e:
         print(f"  -> failed to load: {e}")
         return False
@@ -307,7 +430,8 @@ def screenshot_page_with_term(
     page.add_style_tag(content=HIDE_CHROME_CSS + HIGHLIGHT_CSS)
 
     # Highlight a random match on this page
-    matches_count = page.evaluate(HIGHLIGHT_JS, term)
+    script = HIGHLIGHT_JS_CASE if case_sensitive else HIGHLIGHT_JS
+    matches_count = page.evaluate(script, term)
     if not matches_count:
         print("  -> term not found on page; skipping")
         return False
@@ -324,20 +448,15 @@ def screenshot_page_with_term(
         return False
 
     # Take full-viewport screenshot
-    raw_path = os.path.join(frames_dir, f"raw_{frame_idx:05d}.png")
     final_path = os.path.join(frames_dir, f"frame_{frame_idx:05d}.png")
     try:
-        page.screenshot(path=raw_path, full_page=False)
+        raw_image = page.screenshot(full_page=False)
     except Exception as e:
         print(f"  -> screenshot failed: {e}")
         return False
 
     # Crop around highlight and record center in final frame
-    try:
-        fx, fy = crop_around_highlight(raw_path, box, final_path, out_w, out_h)
-    finally:
-        if os.path.exists(raw_path):
-            os.remove(raw_path)
+    fx, fy = crop_around_highlight(raw_image, box, final_path, out_w, out_h)
 
     if centers is not None:
         centers.append(
@@ -459,17 +578,29 @@ def main():
     used = 0
     with sync_playwright() as p:
         # Render at 2× resolution for sharper downscaled frames
-        viewport_w = args.width * 2
-        viewport_h = args.height * 2
+        capture_scale = max(args.capture_scale, 1.0)
+        viewport_w = int(args.width * capture_scale)
+        viewport_h = int(args.height * capture_scale)
 
-        browser = p.chromium.launch()
+        browser = launch_chromium(p)
+        if browser is None:
+            return
         page = browser.new_page(
             viewport={"width": viewport_w, "height": viewport_h}
         )
 
         for title in titles:
             ok = screenshot_page_with_term(
-                page, title, term, used, frames_dir, args.width, args.height, args.zoom, centers=centers,
+                page,
+                title,
+                term,
+                used,
+                frames_dir,
+                args.width,
+                args.height,
+                args.zoom,
+                centers=centers,
+                case_sensitive=args.case_sensitive,
             )
             if ok:
                 used += 1

@@ -49,12 +49,18 @@ def main():
     frames_dir = args.frames_dir or os.path.join(run_dir, "frames")
     centers = args.centers or os.path.join(run_dir, "centers.csv")
     out_dir = args.out_dir or os.path.join(run_dir, "diagnostics")
-    run_full_diagnostics(
+    summary = run_full_diagnostics(
         frames_dir=frames_dir,
         centers_csv=centers,
         out_dir=out_dir,
         skip_duplicates=not args.keep_duplicates,
     )
+    if summary:
+        print(
+            f"[summary] frames analyzed: {summary.get('frames_analyzed', 0)}, "
+            f"skipped duplicates: {summary.get('skipped_frames', 0)}, "
+            f"mean center error: {summary.get('mean_center_error_pct', 0):.2f}%"
+        )
 
 
 if __name__ == "__main__":
